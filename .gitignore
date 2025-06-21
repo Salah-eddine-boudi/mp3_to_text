@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+*.wav
+*.mp3
+D:/stage 20242025/lake/mp3_transcipt/
