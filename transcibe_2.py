@@ -6,54 +6,50 @@ import torchaudio
 from pymongo import MongoClient
 from transformers import pipeline
 
+
 def format_timestamp(ms: float) -> str:
     """Convert milliseconds to HH:MM:SS format."""
     s = int(ms / 1000)
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
-    if h:
-        return f"{h:02d}:{m:02d}:{sec:02d}"
-    return f"{m:02d}:{sec:02d}"
+    return f"{h:02d}:{m:02d}:{sec:02d}"
 
-# Configuration de la vitesse et des timestamps
-CHUNK_LENGTH_S = 5               # Durée de chaque bloc
-STRIDE_LENGTH_S = (1, 1)         # Recouvrement avant/après
-RETURN_TIMESTAMPS = "word"      # Retourner timestamps par mot
+# ASR configuration
+CHUNK_LENGTH_S = 10           # Longer chunk duration for fewer blocks
+STRIDE_LENGTH_S = (1, 1)      # Overlap in seconds
+RETURN_TIMESTAMPS = "word"   # Word-level timestamps
 
-# Mapping des langues
-LANG_MODEL_MAP = {
-    'ar': 'jonatasgrosman/wav2vec2-large-xlsr-53-arabic',
-    'en': 'facebook/wav2vec2-large-960h',
-    'fr': 'jonatasgrosman/wav2vec2-large-xlsr-fr',
-    'es': 'jonatasgrosman/wav2vec2-large-xlsr-es',
-    'tzm': 'facebook/wav2vec2-large-xlsr-53',
-    'darija': 'facebook/wav2vec2-large-xlsr-53'
-}
-DEFAULT_MODEL = 'facebook/wav2vec2-large-xlsr-53'
+# Arabic language model
+AR_MODEL = 'jonatasgrosman/wav2vec2-large-xlsr-53-arabic'
 
 # MongoDB setup
 client = MongoClient("mongodb://localhost:27017")
 db = client["audioDB"]
 col = db["audioFiles"]
 
-# Dossier de sortie
-TEXT_OUTPUT_DIR = r"D:\stage 20242025\lake\mp3_transcipt"
+# Output directory
+TEXT_OUTPUT_DIR = r"D:\stage 20242025\lake\mp3_transcript"
 os.makedirs(TEXT_OUTPUT_DIR, exist_ok=True)
 
-# Création de la pipeline ASR avec timestamps
-def get_pipeline_for_language(lang: str):
-    model_id = LANG_MODEL_MAP.get(lang.lower(), DEFAULT_MODEL)
-    return pipeline(
-        "automatic-speech-recognition",
-        model=model_id,
-        chunk_length_s=CHUNK_LENGTH_S,
-        stride_length_s=STRIDE_LENGTH_S,
-        return_timestamps=RETURN_TIMESTAMPS
-    )
+# ASR pipeline for Arabic
+asr_pipe = pipeline(
+    "automatic-speech-recognition",
+    model=AR_MODEL,
+    chunk_length_s=CHUNK_LENGTH_S,
+    stride_length_s=STRIDE_LENGTH_S,
+    return_timestamps=RETURN_TIMESTAMPS
+)
 
-# Transcrire audio, extraire phrase par phrase avec timing et stocker
-def transcrire_et_stocker(path_audio: str, doc_id: str, lang: str = 'en'):
-    asr_pipe = get_pipeline_for_language(lang)
+# Check if transcription already exists
+def is_already_transcribed(doc_id: str):
+    return col.find_one({"_id": doc_id, "transcript_ar": {"$exists": True}}) is not None
+
+# Transcribe and store Arabic audio with enhanced formatting
+def transcrire_et_stocker_arabe(path_audio: str, doc_id: str):
+    if is_already_transcribed(doc_id):
+        print(f"> Document {doc_id} déjà transcrit.")
+        return
+
     lines = []
 
     with sf.SoundFile(path_audio) as f:
@@ -66,64 +62,71 @@ def transcrire_et_stocker(path_audio: str, doc_id: str, lang: str = 'en'):
                 block = torchaudio.functional.resample(
                     torch.tensor(block).unsqueeze(0), sr, 16000
                 ).squeeze(0).numpy()
-            # Appel ASR avec timestamps
+            # ASR inference
             result = asr_pipe(block)
-            chunks = result.get("chunks", [])
-            for chunk in chunks:
-                start_ms = chunk['timestamp'][0]
+            current_line = ""
+            current_ts = None
+            for chunk in result.get("chunks", []):
                 text = chunk['text'].strip()
                 if text:
-                    ts = format_timestamp(start_ms)
-                    lines.append(f"[{ts}] {text}")
-            print(f"Bloc {i+1} ({lang}) traité avec {len(chunks)} segments")
+                    if current_ts is None:
+                        current_ts = chunk['timestamp'][0]
+                    current_line += " " + text
+                    if len(current_line.split()) >= 10:
+                        ts_formatted = format_timestamp(current_ts)
+                        lines.append(f"[{ts_formatted}] {current_line.strip()}")
+                        current_line = ""
+                        current_ts = None
+            if current_line:
+                ts_formatted = format_timestamp(current_ts)
+                lines.append(f"[{ts_formatted}] {current_line.strip()}")
+            print(f"Bloc {i+1} (ar) traité")
 
-    transcript_full = "\n".join(lines)
+    transcript_full = "\n\n".join(lines)  # Double line breaks for better readability
 
-    # Sauvegarde dans le fichier texte
+    # Save transcript to text file
     base = os.path.splitext(os.path.basename(path_audio))[0]
-    txt_path = os.path.join(TEXT_OUTPUT_DIR, f"{base}_{lang}.txt")
+    txt_path = os.path.join(TEXT_OUTPUT_DIR, f"{base}_ar.txt")
     with open(txt_path, "w", encoding="utf-8") as f_txt:
         f_txt.write(transcript_full)
-    print(f"> Transcript ({lang}) écrit dans {txt_path}")
+    print(f"> Transcript arabe écrit dans {txt_path}")
 
-    # Stockage en base MongoDB
+    # Update MongoDB
     col.update_one(
         {"_id": doc_id},
-        {"$set": {"transcript": transcript_full,
-                   "asr_model": LANG_MODEL_MAP.get(lang.lower(), DEFAULT_MODEL),
-                   "language": lang}},
+        {"$set": {"transcript_ar": transcript_full, "asr_model": AR_MODEL}},
         upsert=True
     )
-    print(f"> Document Mongo mis à jour pour {doc_id}, langue={lang}")
+    print(f"> Document Mongo mis à jour pour {doc_id} (arabe)")
 
-# Traitement en script direct
-if __name__ == "__main__":
+# Main script entry point
+def main():
     folder = r"D:\stage 20242025\lake\mp3"
     for fn in os.listdir(folder):
         if fn.lower().endswith((".wav", ".mp3")):
             doc_id = os.path.splitext(fn)[0]
             path = os.path.join(folder, fn)
-            for lang in LANG_MODEL_MAP.keys():
-                transcrire_et_stocker(path, doc_id, lang)
+            transcrire_et_stocker_arabe(path, doc_id)
 
-# main.py inchangé, accepte toujours 'language' en JSON
+if __name__ == "__main__":
+    main()
+
 
 # main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from transcribe import transcrire_et_stocker
+from transcribe import transcrire_et_stocker_arabe
 
-app = FastAPI(title="ASR Service")
+app = FastAPI(title="ASR Service Arabe")
 
 class TranscriptionRequest(BaseModel):
     doc_id: str
     path_audio: str
-    language: str = 'auto'
 
-@app.post("/transcribe")
-async def transcribe(req: TranscriptionRequest):
+@app.post("/transcribe_ar")
+async def transcribe_ar(req: TranscriptionRequest):
     try:
-        transcrire_et_stocker(req.path_audio, req.doc_id, req.language)
-        return {"status": "success", "doc_id": req.doc_id, "language": req.language}
+        transcrire_et_stocker_arabe(req.path_audio, req.doc_id)
+        return {"status": "success", "doc_id": req.doc_id, "language": "ar"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
